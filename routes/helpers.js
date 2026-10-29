@@ -1,28 +1,67 @@
+const User = require('../models/user');
+
 const OID = /^[0-9a-fA-F]{24}$/;
 const isId = (v) => typeof v === 'string' && OID.test(v);
 
+// Runs fn(session) as one atomic transaction. fn may be retried on a conflict, so do all
+// reads inside it and pass the session to every query.
+const inTransaction = (fn) => User.db.transaction(fn, {
+    readConcern: { level: 'snapshot' },
+    writeConcern: { w: 'majority' }
+});
+
+// Operators that run server-side JavaScript; never accepted inside "where"
+const FORBIDDEN_OPERATORS = ['$where', '$expr', '$function', '$accumulator'];
+
 const send = (res, status, message, data) => res.status(status).json({ message, data });
 
-const fail = (status, message) => Object.assign(new Error(message), { status });
-
-// Wrap an async handler: known errors -> their status, anything else -> generic 500
-const wrap = (fn) => async (req, res) => {
-    try {
-        await fn(req, res);
-    } catch (e) {
-        if (e.status) {
-            return send(res, e.status, e.message, null);
-        }
-        if (e.code === 11000) {
-            return send(res, 400, 'A user with that email already exists', null);
-        }
-        if (e.name === 'CastError' || e.name === 'ValidationError') {
-            return send(res, 400, 'Invalid value in request', null);
-        }
-        console.error(e);
-        send(res, 500, 'Internal server error', null);
+class HttpError extends Error {
+    constructor(status, message) {
+        super(message);
+        this.status = status;
     }
-};
+}
+const fail = (status, message) => new HttpError(status, message);
+
+// Turns every error into a { message, data } response; clients never see Mongoose/MongoDB text
+// eslint-disable-next-line no-unused-vars
+function errorHandler(err, req, res, next) {
+    if (err instanceof HttpError) {
+        return send(res, err.status, err.message, null);
+    }
+    if (err.type === 'entity.parse.failed') {
+        return send(res, 400, 'Request body is not valid JSON', null);
+    }
+    if (err.code === 11000) { // only users.email has a unique index
+        return send(res, 400, 'A user with that email already exists', null);
+    }
+    if (err.name === 'CastError' || err.name === 'ValidationError') {
+        return send(res, 400, 'Invalid value in request', null);
+    }
+    console.error(err);
+    send(res, 500, 'Internal server error', null);
+}
+
+function assertObject(body) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        throw fail(400, 'Request body must be a JSON object');
+    }
+}
+
+// Returns the trimmed name
+function requireName(name) {
+    if (typeof name !== 'string' || !name.trim()) {
+        throw fail(400, 'A name is required');
+    }
+    return name.trim();
+}
+
+function hasForbiddenOperator(value) {
+    if (value === null || typeof value !== 'object') {
+        return false;
+    }
+    return Object.keys(value).some((key) => FORBIDDEN_OPERATORS.includes(key) || hasForbiddenOperator(value[key]));
+}
 
 function parseObject(raw, name) {
     if (raw === undefined) {
@@ -65,20 +104,24 @@ function parseSelect(raw) {
     return select;
 }
 
-// GET /:id -> only select applies
-async function findOne(Model, req, name) {
-    const select = parseSelect(req.query.select);
-    const doc = isId(req.params.id) ? await Model.findById(req.params.id).select(select || {}) : null;
+// Load one document by id (404 if malformed or unknown); pass { session } inside a transaction
+async function findById(Model, id, name, { select, session } = {}) {
+    const doc = isId(id) ? await Model.findById(id).select(select || {}).session(session || null) : null;
     if (!doc) {
         throw fail(404, `${name} not found`);
     }
     return doc;
 }
 
+// GET /:id -> only select applies
+function findOne(Model, req, name) {
+    return findById(Model, req.params.id, name, { select: parseSelect(req.query.select) });
+}
+
 // GET collection -> where, sort, select, skip, limit, count (all done by Mongoose)
 async function findMany(Model, req, defaultLimit) {
     const where = parseObject(req.query.where, 'where') || {};
-    if (JSON.stringify(where).includes('"$where"')) {
+    if (hasForbiddenOperator(where)) {
         throw fail(400, 'Unsupported operator in "where"');
     }
     const sort = parseObject(req.query.sort, 'sort');
@@ -87,10 +130,7 @@ async function findMany(Model, req, defaultLimit) {
     }
     const select = parseSelect(req.query.select);
     const skip = parseNonNegativeInt(req.query.skip, 'skip');
-    let limit = parseNonNegativeInt(req.query.limit, 'limit');
-    if (limit === undefined) {
-        limit = defaultLimit;
-    }
+    const limit = parseNonNegativeInt(req.query.limit, 'limit') ?? defaultLimit;
     const count = req.query.count;
     if (count !== undefined && count !== 'true' && count !== 'false') {
         throw fail(400, '"count" must be true or false');
@@ -115,8 +155,7 @@ async function findMany(Model, req, defaultLimit) {
         }
         return await q;
     } catch (e) {
-        // The query itself was rejected (e.g. unknown operator in "where"): the client's fault.
-        // Mongoose throws a plain Error "Can't use $op" while casting; MongoDB answers MongoServerError.
+        // A query the database rejects (e.g. an unknown operator in "where") is the client's fault
         if (e.name === 'MongoServerError' || (e.name === 'Error' && /^Can't use /.test(e.message))) {
             throw fail(400, 'The query parameters are not valid');
         }
@@ -124,4 +163,4 @@ async function findMany(Model, req, defaultLimit) {
     }
 }
 
-module.exports = { isId, send, fail, wrap, findOne, findMany };
+module.exports = { isId, send, fail, inTransaction, errorHandler, assertObject, requireName, findById, findOne, findMany };

@@ -1,27 +1,29 @@
 const express = require('express');
 const Task = require('../models/task');
 const User = require('../models/user');
-const { isId, send, fail, wrap, findOne, findMany } = require('./helpers');
+const { isId, send, fail, inTransaction, assertObject, requireName, findById, findOne, findMany } = require('./helpers');
 
 const router = express.Router();
 
-// Validate the body, then create (task = null) or replace (task = existing doc) a task
-// and keep users' pendingTasks in sync.
-// Order: format 400 -> assigned user missing 404 -> assignedUserName mismatch 400 -> writes.
-async function saveTask(task, body) {
-    if (!body || typeof body !== 'object' || Array.isArray(body)) {
-        throw fail(400, 'Request body must be a JSON object');
-    }
-    const { name, description, completed, assignedUser, assignedUserName } = body;
-    if (typeof name !== 'string' || !name.trim()) {
-        throw fail(400, 'A name is required');
-    }
-
-    const d = body.deadline;
-    const deadline = typeof d === 'string' || typeof d === 'number' ? new Date(/^\d+$/.test(d) ? Number(d) : d) : null;
-    if (!deadline || isNaN(deadline.getTime())) {
+// ISO strings, YYYY-MM-DD, or epoch milliseconds (number or digit-only string)
+function parseDeadline(value) {
+    if (typeof value !== 'string' && typeof value !== 'number') {
         throw fail(400, 'A valid deadline is required');
     }
+    const deadline = new Date(/^\d+$/.test(value) ? Number(value) : value);
+    if (isNaN(deadline.getTime())) {
+        throw fail(400, 'A valid deadline is required');
+    }
+    return deadline;
+}
+
+// Create (task = null) or replace (task = existing) a task and keep users' pendingTasks in sync.
+// Checks run in order: bad format 400, user not found 404, name mismatch 400. Then the writes.
+async function saveTask(session, task, body) {
+    assertObject(body);
+    const { description, completed, assignedUser, assignedUserName } = body;
+    const name = requireName(body.name);
+    const deadline = parseDeadline(body.deadline);
 
     if (description !== undefined && typeof description !== 'string') {
         throw fail(400, 'description must be a string');
@@ -44,7 +46,7 @@ async function saveTask(task, body) {
     const uid = (assignedUser || '').toLowerCase();
     let uname = 'unassigned';
     if (uid) {
-        const user = await User.findById(uid);
+        const user = await User.findById(uid).select('name').lean().session(session);
         if (!user) {
             throw fail(404, 'Assigned user not found');
         }
@@ -59,51 +61,51 @@ async function saveTask(task, body) {
     const previous = task ? task.assignedUser : '';
     task = task || new Task();
     task.set({
-        name: name.trim(),
+        name,
         description: description === undefined ? '' : description,
         deadline,
         completed: completed === true,
         assignedUser: uid,
         assignedUserName: uname
     });
-    await task.save();
+    await task.save({ session });
 
     // Two-way reference: the old user loses the task, the new user gets it if it is pending
     if (previous && previous !== uid) {
-        await User.updateOne({ _id: previous }, { $pull: { pendingTasks: task.id } });
+        await User.updateOne({ _id: previous }, { $pull: { pendingTasks: task.id } }, { session });
     }
     if (uid) {
         const update = task.completed ? { $pull: { pendingTasks: task.id } } : { $addToSet: { pendingTasks: task.id } };
-        await User.updateOne({ _id: uid }, update);
-    }
-    return task;
-}
-
-async function findTask(id) {
-    const task = isId(id) ? await Task.findById(id) : null;
-    if (!task) {
-        throw fail(404, 'Task not found');
+        await User.updateOne({ _id: uid }, update, { session });
     }
     return task;
 }
 
 router.route('/')
-    .get(wrap(async (req, res) => send(res, 200, 'OK', await findMany(Task, req, 100))))
-    .post(wrap(async (req, res) => send(res, 201, 'Task created', await saveTask(null, req.body))));
+    .get(async (req, res) => send(res, 200, 'OK', await findMany(Task, req, 100)))
+    .post(async (req, res) => {
+        const task = await inTransaction((session) => saveTask(session, null, req.body));
+        send(res, 201, 'Task created', task);
+    });
 
 router.route('/:id')
-    .get(wrap(async (req, res) => send(res, 200, 'OK', await findOne(Task, req, 'Task'))))
-    .put(wrap(async (req, res) => {
-        const task = await findTask(req.params.id);
-        send(res, 200, 'Task updated', await saveTask(task, req.body));
-    }))
-    .delete(wrap(async (req, res) => {
-        const task = await findTask(req.params.id);
-        if (task.assignedUser) {
-            await User.updateOne({ _id: task.assignedUser }, { $pull: { pendingTasks: task.id } });
-        }
-        await task.deleteOne();
+    .get(async (req, res) => send(res, 200, 'OK', await findOne(Task, req, 'Task')))
+    .put(async (req, res) => {
+        const task = await inTransaction(async (session) => {
+            const existing = await findById(Task, req.params.id, 'Task', { session });
+            return saveTask(session, existing, req.body);
+        });
+        send(res, 200, 'Task updated', task);
+    })
+    .delete(async (req, res) => {
+        await inTransaction(async (session) => {
+            const task = await findById(Task, req.params.id, 'Task', { session });
+            if (task.assignedUser) {
+                await User.updateOne({ _id: task.assignedUser }, { $pull: { pendingTasks: task.id } }, { session });
+            }
+            await task.deleteOne({ session });
+        });
         res.status(204).end();
-    }));
+    });
 
 module.exports = router;

@@ -1,8 +1,7 @@
-module.exports = function (router) {
+const router = require('express').Router();
 
-    router.route('/').get(function (req, res) {
-        res.json({ message: 'OK', data: 'APIed Piper is running' });
-    });
+router.get('/', (req, res) => {
+    res.json({ message: 'OK', data: 'APIed Piper is running' });
+});
 
-    return router;
-}
+module.exports = router;

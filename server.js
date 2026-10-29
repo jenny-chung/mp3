@@ -1,10 +1,12 @@
 // Get the packages we need
 var express = require('express'),
-    router = express.Router(),
     mongoose = require('mongoose');
 
 // Read .env file
 require('dotenv').config();
+
+// Turns errors into { message, data } responses
+var errorHandler = require('./routes/helpers').errorHandler;
 
 // Create our Express application
 var app = express();
@@ -29,19 +31,13 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 // Use routes as a module (see index.js)
-require('./routes')(app, router);
+require('./routes')(app);
 
-// Unknown routes -> 404; bad JSON bodies -> 400; anything else -> generic 500
+// Unknown routes -> 404; every error (bad JSON, validation, unexpected) is answered by errorHandler
 app.use(function (req, res) {
     res.status(404).json({ message: 'Route not found', data: null });
 });
-app.use(function (err, req, res, next) {
-    if (err.type === 'entity.parse.failed') {
-        return res.status(400).json({ message: 'Request body is not valid JSON', data: null });
-    }
-    console.error(err);
-    res.status(500).json({ message: 'Internal server error', data: null });
-});
+app.use(errorHandler);
 
 // Start the server
 app.listen(port);
